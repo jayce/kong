@@ -1,9 +1,11 @@
 local utils  = require "kong.tools.utils"
 
 
-local max          = math.max
 local fmt          = string.format
+local now          = ngx.now
+local type         = type
 local null         = ngx.null
+local error        = error
 local concat       = table.concat
 local tonumber     = tonumber
 local setmetatable = setmetatable
@@ -31,9 +33,9 @@ INSERT INTO cluster_events (
 ) VALUES (
   %s,
   %s,
+  CURRENT_TIMESTAMP(3) AT TIME ZONE 'UTC',
   TO_TIMESTAMP(%s) AT TIME ZONE 'UTC',
-  TO_TIMESTAMP(%s) AT TIME ZONE 'UTC',
-  TO_TIMESTAMP(%s) AT TIME ZONE 'UTC',
+  CURRENT_TIMESTAMP(3) AT TIME ZONE 'UTC' + INTERVAL '%d second',
   %s,
   %s
 )
@@ -50,10 +52,15 @@ local SELECT_INTERVAL_QUERY = [[
     FROM "cluster_events"
    WHERE "channel" IN (%s)
      AND "at" >  TO_TIMESTAMP(%s) AT TIME ZONE 'UTC'
-     AND "at" <= TO_TIMESTAMP(%s) AT TIME ZONE 'UTC'
+     AND "at" <= %s
 ORDER BY "at"
    LIMIT %s
   OFFSET %s
+]]
+
+
+local SERVER_TIME_QUERY = [[
+SELECT EXTRACT(EPOCH FROM CURRENT_TIMESTAMP(3) AT TIME ZONE 'UTC') AS "now"
 ]]
 
 
@@ -83,14 +90,11 @@ function _M.should_use_polling()
 end
 
 
-function _M:insert(node_id, channel, at, data, nbf)
-  local expire_at = max(at + self.event_ttl, at)
-  expire_at = self.connector:escape_literal(tonumber(fmt("%.3f", expire_at)))
-
-  if not nbf then
-    nbf = "NULL"
-  else
+function _M:insert(node_id, channel, data, nbf)
+  if nbf then
     nbf = self.connector:escape_literal(tonumber(fmt("%.3f", nbf)))
+  else
+    nbf = "NULL"
   end
 
   local pg_id      = self.connector:escape_literal(utils.uuid())
@@ -98,8 +102,8 @@ function _M:insert(node_id, channel, at, data, nbf)
   local pg_channel = self.connector:escape_literal(channel)
   local pg_data    = self.connector:escape_literal(data)
 
-  local q = fmt(INSERT_QUERY, pg_id, pg_node_id, at, nbf, expire_at,
-                pg_channel, pg_data)
+  local q = fmt(INSERT_QUERY, pg_id, pg_node_id, nbf, self.event_ttl,
+                              pg_channel, pg_data)
 
   local res, err = self.connector:query(q)
   if not res then
@@ -113,23 +117,35 @@ end
 function _M:select_interval(channels, min_at, max_at)
   local n_chans = #channels
   local p_chans = new_tab(n_chans, 0)
-  local p_minat = self.connector:escape_literal(tonumber(fmt("%.3f", min_at)))
-  local p_maxat = self.connector:escape_literal(tonumber(fmt("%.3f", max_at)))
 
   for i = 1, n_chans do
     p_chans[i] = self.connector:escape_literal(channels[i])
   end
 
-  local query_template = fmt(SELECT_INTERVAL_QUERY,
-                             concat(p_chans, ", "),
-                             p_minat,
-                             p_maxat,
-                             self.page_size,
-                             "%s")
+  p_chans = concat(p_chans, ", ")
+
+  local p_minat = self.connector:escape_literal(tonumber(fmt("%.3f", min_at or 0)))
+  local p_maxat
+  if max_at then
+    p_maxat = fmt("TO_TIMESTAMP(%s) AT TIME ZONE 'UTC'",
+                  self.connector:escape_literal(tonumber(fmt("%.3f", max_at))))
+  else
+    p_maxat = "CURRENT_TIMESTAMP(3) AT TIME ZONE 'UTC'"
+  end
+
+  local query_template = fmt(SELECT_INTERVAL_QUERY, p_chans,
+                                                    p_minat,
+                                                    p_maxat,
+                                                    self.page_size,
+                                                    "%s")
 
   local page = 0
-
+  local last_page
   return function()
+    if last_page then
+      return nil
+    end
+
     local offset = page * self.page_size
     local q = fmt(query_template, offset)
 
@@ -144,10 +160,13 @@ function _M:select_interval(channels, min_at, max_at)
     end
 
     for i = 1, len do
-      local row = res[i]
-      if row.nbf == null then
-        row.nbf = nil
+      if res[i].nbf == null then
+        res[i].nbf = nil
       end
+    end
+
+    if len < self.page_size then
+      last_page = true
     end
 
     page = page + 1
@@ -159,6 +178,16 @@ end
 
 function _M:truncate_events()
   return self.connector:query("TRUNCATE cluster_events")
+end
+
+
+function _M:server_time()
+  local res = self.connector:query(SERVER_TIME_QUERY)
+  if res then
+    return res[1].now
+  end
+
+  return now()
 end
 
 

@@ -26,6 +26,11 @@ function OffStrategy:truncate_events()
 end
 
 
+function OffStrategy:server_time()
+  return ngx.now()
+end
+
+
 function off.new(db, page_size, event_ttl)
   return setmetatable({}, OffStrategy)
 end

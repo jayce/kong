@@ -4,6 +4,7 @@ local ERR       = ngx.ERR
 local CRIT      = ngx.CRIT
 local max       = math.max
 local type      = type
+local error     = error
 local pcall     = pcall
 local insert    = table.insert
 local ngx_log   = ngx.log
@@ -31,12 +32,12 @@ local function log(lvl, ...)
 end
 
 
-local function nbf_cb_handler(premature, cb, row)
+local function nbf_cb_handler(premature, cb, data)
   if premature then
     return
   end
 
-  cb(row.data)
+  cb(data)
 end
 
 
@@ -117,7 +118,7 @@ function _M.new(opts)
 
   -- set current time (at)
 
-  local ok, err = self.shm:safe_set(CURRENT_AT_KEY, ngx_now())
+  local ok, err = self.shm:safe_set(CURRENT_AT_KEY, strategy:server_time())
   if not ok then
     return nil, "failed to set 'at' in shm: " .. err
   end
@@ -157,7 +158,7 @@ function _M:broadcast(channel, data, nbf)
   --log(DEBUG, "broadcasting on channel: '", channel, "' data: ", data,
   --           " with nbf: ", nbf and nbf or "none")
 
-  local ok, err = self.strategy:insert(self.node_id, channel, ngx_now(), data, nbf)
+  local ok, err = self.strategy:insert(self.node_id, channel, data, nbf)
   if not ok then
     return nil, err
   end
@@ -203,6 +204,61 @@ function _M:subscribe(channel, cb, start_polling)
 end
 
 
+local function process_event(self, row)
+  if row.node_id == self.node_id then
+    return true
+  end
+
+  local ran, err = self.events_shm:get(row.id)
+  if err then
+    return nil, "failed to probe if event ran: " .. err
+  end
+
+  if ran then
+    return true
+  end
+
+  log(DEBUG, "new event (channel: '", row.channel, "') data: '", row.data,
+             "' nbf: '", row.nbf or "none", "'")
+
+  local exptime = self.poll_interval + self.poll_offset
+
+  -- mark as ran before running in case of long-running callbacks
+  local ok, err = self.events_shm:set(row.id, true, exptime)
+  if not ok then
+    return nil, "failed to mark event as ran: " .. err
+  end
+
+  local cbs = self.callbacks[row.channel]
+  if not cbs then
+    return true
+  end
+
+  for j = 1, #cbs do
+    if not row.nbf then
+      -- unique callback run without delay
+      local ok, err = pcall(cbs[j], row.data)
+      if not ok and not ngx_debug then
+        log(ERR, "callback threw an error: ", err)
+      end
+
+    else
+      -- unique callback run after some delay
+      local delay = max(row.nbf - ngx_now(), 0)
+
+      log(DEBUG, "delaying nbf event by ", delay, "s")
+
+      local ok, err = timer_at(delay, nbf_cb_handler, cbs[j], row.data)
+      if not ok then
+        log(ERR, "failed to schedule nbf event timer: ", err)
+      end
+    end
+  end
+
+  return true
+end
+
+
 local function poll(self)
   -- get events since last poll
 
@@ -219,7 +275,7 @@ local function poll(self)
 
   min_at = min_at - self.poll_offset - 0.001
 
-  local max_at = ngx_now()
+  local max_at = self.strategy:server_time()
 
   log(DEBUG, "polling events from: ", min_at, " to: ", max_at)
 
@@ -235,51 +291,13 @@ local function poll(self)
       end
     end
 
-    for i = 1, #rows do
-      local row = rows[i]
-
-      if row.node_id ~= self.node_id then
-        local ran, err = self.events_shm:get(row.id)
-        if err then
-          return nil, "failed to probe if event ran: " .. err
-        end
-
-        if not ran then
-          log(DEBUG, "new event (channel: '", row.channel, "') data: '",
-                     row.data, "' nbf: '", row.nbf or "none", "'")
-
-          local exptime = self.poll_interval + self.poll_offset
-
-          -- mark as ran before running in case of long-running callbacks
-          local ok, err = self.events_shm:set(row.id, true, exptime)
-          if not ok then
-            return nil, "failed to mark event as ran: " .. err
-          end
-
-          local cbs = self.callbacks[row.channel]
-          if cbs then
-            for j = 1, #cbs do
-              if not row.nbf then
-                -- unique callback run without delay
-                local ok, err = pcall(cbs[j], row.data)
-                if not ok and not ngx_debug then
-                  log(ERR, "callback threw an error: ", err)
-                end
-
-              else
-                -- unique callback run after some delay
-                local delay = max(row.nbf - ngx_now(), 0)
-
-                log(DEBUG, "delaying nbf event by ", delay, "s")
-
-                local ok, err = timer_at(delay, nbf_cb_handler, cbs[j], row)
-                if not ok then
-                  log(ERR, "failed to schedule nbf event timer: ", err)
-                end
-              end
-            end
-          end
-        end
+    local count = #rows
+    for i = 1, count do
+      local ok, err = process_event(self, rows[i])
+      if not ok then
+        -- TODO: this means we will skip the rest of events?
+        -- TODO: should we update CURRENT_AT_KEY?
+        return nil, err
       end
     end
   end
