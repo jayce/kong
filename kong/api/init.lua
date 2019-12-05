@@ -62,7 +62,7 @@ do
       else
         routes[route_pattern] = {
           schema  = verbs.schema or schema,
-          methods = verbs,
+          methods = verbs.methods or verbs,
         }
       end
     end
